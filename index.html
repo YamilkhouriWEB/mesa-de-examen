@@ -1,4 +1,4 @@
-<!doctype html> 
+<!doctype html>
 <html lang="es">
 <head>
 <meta charset="utf-8">
@@ -173,7 +173,7 @@ const ICON={
 };
 
 /* ================= configuración ================= */
-const CFG=Object.assign({key:'',model:'claude-haiku-5-5',repModel:'claude-sonnet-5-5',voice:'',rate:1.05,silence:1.6,lang:'es-AR',barge:false,tts:true},LSg('cfg')||{});
+const CFG=Object.assign({provider:'gemini',key:'',model:'claude-haiku-5-5',repModel:'claude-sonnet-5-5',gkey:'',gmodel:'gemini-3.1-flash-lite',grepModel:'gemini-3.5-flash',voice:'',rate:1.05,silence:1.6,lang:'es-AR',barge:false,tts:true},LSg('cfg')||{});
 const saveCfg=()=>LSs('cfg',CFG);
 const SRC=window.SpeechRecognition||window.webkitSpeechRecognition;
 const TTS='speechSynthesis' in window&&'SpeechSynthesisUtterance' in window;
@@ -286,13 +286,33 @@ function sampleNotes(mids,budget){
   const out=[];for(let j=0;j<k;j++)out.push(pool[Math.floor(Math.random()*pool.length)]);
   const seen=new Set();return blockOf(out.filter(x=>!seen.has(x.i)&&seen.add(x.i)));
 }
-const BIG=90000;
 
-/* ================= cliente de la API de Anthropic ================= */
-const API='https://api.anthropic.com/v1/messages';
+/* ================= clientes de IA: Gemini (gratis) o Claude (de pago) ================= */
 class ApiErr extends Error{constructor(kind,msg){super(msg);this.kind=kind}}
+const isG=()=>CFG.provider==='gemini';
+const activeKey=()=>isG()?CFG.gkey:CFG.key;
+const chatModel=()=>isG()?CFG.gmodel:CFG.model;
+const reportModel=()=>isG()?(CFG.grepModel||CFG.gmodel):(CFG.repModel||CFG.model);
+const bigLimit=()=>isG()?40000:90000;
+const providerName=()=>isG()?'Gemini':'Claude';
+async function sseEach(r,onEvent){
+  const rd=r.body.getReader(),dec=new TextDecoder();let buf='';
+  for(;;){
+    const {value,done}=await rd.read();if(done)break;
+    buf+=dec.decode(value,{stream:true}).replace(/\r\n/g,'\n');
+    let i;while((i=buf.indexOf('\n\n'))>=0){
+      const ev=buf.slice(0,i);buf=buf.slice(i+2);
+      const line=ev.split('\n').find(l=>l.startsWith('data:'));if(!line)continue;
+      const raw=line.slice(5).trim();if(!raw||raw==='[DONE]')continue;
+      let j;try{j=JSON.parse(raw)}catch(e){continue}
+      onEvent(j);
+    }
+  }
+}
+/* ---- Anthropic ---- */
+const API='https://api.anthropic.com/v1/messages';
 async function apiFetch(body,signal){
-  if(!CFG.key)throw new ApiErr('nokey','Falta la clave de la API. Pegala en Ajustes.');
+  if(!CFG.key)throw new ApiErr('nokey','Falta la clave de la API de Claude. Pegala en Ajustes.');
   let r;
   try{
     r=await fetch(API,{method:'POST',signal,headers:{'content-type':'application/json','x-api-key':CFG.key,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},body:JSON.stringify(body)});
@@ -309,22 +329,67 @@ async function apiFetch(body,signal){
   }
   return r;
 }
-async function streamChat({model,system,messages,max_tokens,signal,onDelta}){
-  const r=await apiFetch({model,max_tokens,system,messages,stream:true},signal);
-  const rd=r.body.getReader(),dec=new TextDecoder();let buf='';
-  for(;;){
-    const {value,done}=await rd.read();if(done)break;
-    buf+=dec.decode(value,{stream:true});
-    let i;while((i=buf.indexOf('\n\n'))>=0){
-      const ev=buf.slice(0,i);buf=buf.slice(i+2);
-      const line=ev.split('\n').find(l=>l.startsWith('data:'));if(!line)continue;
-      let j;try{j=JSON.parse(line.slice(5).trim())}catch(e){continue}
-      if(j.type==='content_block_delta'&&j.delta&&j.delta.type==='text_delta')onDelta(j.delta.text);
-      else if(j.type==='error')throw new ApiErr('busy',(j.error&&j.error.message)||'Error del servicio.');
-    }
-  }
+/* ---- Gemini ---- */
+const GBASE='https://generativelanguage.googleapis.com/v1beta/models/';
+function thinkLevel(model){
+  if(/3\.8-flash/.test(model))return'low';
+  if(/3\.5-flash-lite|3\.6-flash/.test(model))return'minimal';
+  return null;
 }
-async function completeOnce({model,system,messages,max_tokens,signal}){
+function gBody({system,messages,max_tokens,model,json}){
+  const sysText=Array.isArray(system)?system.map(b=>b.text).join('\n\n'):String(system||'');
+  const contents=[];
+  messages.forEach(m=>{
+    const role=m.role==='assistant'?'model':'user',last=contents[contents.length-1];
+    if(last&&last.role===role)last.parts[0].text+='\n\n'+m.content;else contents.push({role,parts:[{text:m.content}]});
+  });
+  const gc={maxOutputTokens:Math.max(max_tokens*2,1500),temperature:.7};
+  const tl=thinkLevel(model);if(tl)gc.thinkingConfig={thinkingLevel:tl};
+  if(json)gc.responseMimeType='application/json';
+  return{systemInstruction:{parts:[{text:sysText}]},contents,generationConfig:gc};
+}
+async function gFetch(model,stream,body,signal){
+  if(!CFG.gkey)throw new ApiErr('nokey','Falta la clave de Gemini. Pegala en Ajustes.');
+  const url=GBASE+encodeURIComponent(model)+(stream?':streamGenerateContent?alt=sse':':generateContent');
+  let r;
+  try{
+    r=await fetch(url,{method:'POST',signal,headers:{'content-type':'application/json','x-goog-api-key':CFG.gkey},body:JSON.stringify(body)});
+  }catch(e){if(e.name==='AbortError')throw e;throw new ApiErr('net','No pude conectarme con Google. Revisá tu conexión a internet.')}
+  if(!r.ok){
+    let m='';try{const j=await r.json();m=j&&j.error&&j.error.message||''}catch(e){}
+    if(r.status===400&&/thinking/i.test(m)&&body.generationConfig.thinkingConfig){delete body.generationConfig.thinkingConfig;return gFetch(model,stream,body,signal)}
+    if((r.status===400&&/api key|API_KEY/i.test(m))||r.status===401)throw new ApiErr('auth','Gemini no aceptó la clave. Revisá que esté completa. Si la creaste hace poco, en AI Studio probá restringirla a «Gemini API».');
+    if(r.status===403)throw new ApiErr('auth','Gemini rechazó la clave o no tiene permiso para este modelo. Revisala en AI Studio.');
+    if(r.status===404)throw new ApiErr('model','El modelo «'+model+'» no existe o no está disponible. Cambialo en Ajustes.');
+    if(r.status===429)throw new ApiErr('rate','Llegaste al límite del plan gratuito de Gemini (por minuto o por día). Esperá un momento y reintentá.');
+    if(r.status>=500)throw new ApiErr('busy','El servicio de Google está ocupado. Reintentá en unos segundos.');
+    throw new ApiErr('other','Gemini respondió con un error ('+r.status+'). '+m.slice(0,160));
+  }
+  return r;
+}
+const gText=j=>{
+  if(j&&j.promptFeedback&&j.promptFeedback.blockReason)throw new ApiErr('blocked','Gemini no quiso responder a esto ('+j.promptFeedback.blockReason+'). Probá reformular.');
+  const parts=(j&&j.candidates&&j.candidates[0]&&j.candidates[0].content&&j.candidates[0].content.parts)||[];
+  return parts.filter(p=>p.text&&!p.thought).map(p=>p.text).join('');
+};
+/* ---- interfaz común ---- */
+async function streamChat({model,system,messages,max_tokens,signal,onDelta}){
+  if(isG()){
+    const r=await gFetch(model,true,gBody({system,messages,max_tokens,model}),signal);
+    await sseEach(r,j=>{const t=gText(j);if(t)onDelta(t)});
+    return;
+  }
+  const r=await apiFetch({model,max_tokens,system,messages,stream:true},signal);
+  await sseEach(r,j=>{
+    if(j.type==='content_block_delta'&&j.delta&&j.delta.type==='text_delta')onDelta(j.delta.text);
+    else if(j.type==='error')throw new ApiErr('busy',(j.error&&j.error.message)||'Error del servicio.');
+  });
+}
+async function completeOnce({model,system,messages,max_tokens,signal,json}){
+  if(isG()){
+    const r=await gFetch(model,false,gBody({system,messages,max_tokens,model,json}),signal);
+    return gText(await r.json());
+  }
   const r=await apiFetch({model,max_tokens,system,messages},signal);
   const j=await r.json();return(j.content||[]).map(b=>b.text||'').join('');
 }
@@ -503,7 +568,7 @@ async function callAI(){
   setState('thinking');L.aiText='';L.aiDone=false;fbuf='';ffirst=true;ttsCancel();
   const id=++L.turn;L.ctl=new AbortController();showCaption('');
   try{
-    await streamChat({model:CFG.model,system:systemBlocks(),messages:buildMessages(),max_tokens:L.mode==='tutor'?900:500,signal:L.ctl.signal,
+    await streamChat({model:chatModel(),system:systemBlocks(),messages:buildMessages(),max_tokens:L.mode==='tutor'?900:500,signal:L.ctl.signal,
       onDelta:d=>{if(id!==L.turn)return;if(L.state==='thinking')setState('speaking');L.aiText+=d;showCaption(L.aiText);feed(d)}});
     if(id!==L.turn)return;
     L.aiDone=true;drain(true);addMsg('assistant',L.aiText.trim()||'(sin respuesta)');
@@ -542,9 +607,9 @@ function wakeOff(){try{L.wake&&L.wake.release()}catch(e){}L.wake=null}
 document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible'&&L.on)wakeOn()});
 
 function startSession(){
-  const mids=[...S.sel];if(!mids.length||!CFG.key)return;
+  const mids=[...S.sel];if(!mids.length||!activeKey())return;
   Object.assign(L,{on:true,mode:S.setup.mode,phase:S.setup.mode==='expo'?'expo':'chat',msgs:[],base:'',sess:'',nres:0,skipN:0,aiText:'',aiDone:true,err:'',mids,acc:0,started:Date.now(),turn:L.turn+1,state:'idle',expoMeta:null,report:null});
-  L.big=totalChars(mids)>BIG;L.notesSys=L.big?'':allNotes(mids);
+  L.big=totalChars(mids)>bigLimit();L.notesSys=L.big?'':allNotes(mids);
   unlockTTS();wakeOn();renderLive();
   startTimer();
   if(L.mode==='expo'){setState('listening');listenStart();showYou()}
@@ -590,7 +655,7 @@ async function makeReport(){
   const rel=L.big?'<apuntes_relevantes>\n'+retrieve(trCut.slice(-6000),L.mids,22000)+'\n</apuntes_relevantes>\n\n':'';
   const prompt=`${rel}Esta es la transcripción de una sesión de práctica oral (modo: ${MODES[L.mode].name}). Los dichos de la estudiante vienen de dictado: ignorá puntuación y errores de transcripción.\n\n<transcripcion>\n${trCut}\n</transcripcion>\n\nHacé la devolución final comparando con los apuntes. Devolvé SOLO un objeto JSON:\n{"nota":<número de 0 a 10, o null si no hubo nada que evaluar>,"resumen":"2 o 3 frases","fortalezas":["..."],"para_mejorar":[{"tema":"...","detalle":"qué dicen los apuntes y qué faltó"}],"errores":[{"dijo":"...","correcto":"..."}],"temas_para_repasar":["..."],"consejos":["3 a 5 consejos concretos"]}\nIncluí en "errores" solo afirmaciones suyas que contradigan los apuntes. Listas vacías si no hay nada para decir.`;
   try{
-    const out=await completeOnce({model:CFG.repModel||CFG.model,system:sys,messages:[{role:'user',content:prompt}],max_tokens:2500});
+    const out=await completeOnce({model:reportModel(),system:sys,messages:[{role:'user',content:prompt}],max_tokens:2500,json:true});
     const rep=parseJSON(out);
     const h={id:uid(),ts:Date.now(),mode:L.mode,tema:S.setup.tema,dur:Math.round(L.acc||(Date.now()-L.started)/1000),rep,expo:L.expoMeta||null};
     S.hist.unshift(h);S.hist=S.hist.slice(0,40);dbPut('hist',h).catch(()=>{});
@@ -611,13 +676,13 @@ function renderUsing(){
 function renderCharla(){
   if(L.on){renderLive();return}
   const st=S.setup,m=selMats();
-  const okKey=!!CFG.key,okNotes=m.length>0,okSR=!!SRC,okTTS=TTS;
+  const okKey=!!activeKey(),okNotes=m.length>0,okSR=!!SRC,okTTS=TTS;
   const ready=okKey&&okNotes;
   $('#p-charla').innerHTML=`<div class="card"><h2>Charla en vivo</h2>
     <p class="muted">Hablás, la IA te escucha, te contesta en voz alta y el micrófono se vuelve a abrir solo. Sin botones ni mandar texto: como una llamada.</p>
     <div class="check">
       <div class="it"><span class="dot ${okNotes?'ok':'no'}"></span><span>${okNotes?'Apuntes elegidos':'Falta subir o elegir apuntes'} ${okNotes?'':'<button class="linkbtn" data-go="apuntes">Ir a Apuntes</button>'}</span></div>
-      <div class="it"><span class="dot ${okKey?'ok':'no'}"></span><span>${okKey?'Clave de la API cargada':'Falta la clave de la API'} ${okKey?'':'<button class="linkbtn" data-go="ajustes">Ir a Ajustes</button>'}</span></div>
+      <div class="it"><span class="dot ${okKey?'ok':'no'}"></span><span>${okKey?'Clave de '+providerName()+' cargada':'Falta la clave de '+providerName()} ${okKey?'':'<button class="linkbtn" data-go="ajustes">Ir a Ajustes</button>'}</span></div>
       <div class="it"><span class="dot ${okSR?'ok':'no'}"></span><span>${okSR?'Dictado por voz disponible':'Este navegador no tiene dictado por voz: usá Chrome o Edge (podés escribir igual)'}</span></div>
       <div class="it"><span class="dot ${okTTS?'ok':'no'}"></span><span>${okTTS?'Voz de lectura disponible':'Este navegador no puede leer en voz alta'}</span></div>
     </div></div>
@@ -629,6 +694,7 @@ function renderCharla(){
     ${TTS?tog('tts',CFG.tts,'Que la IA conteste en voz alta'):''}
     ${SRC&&TTS?tog('barge',CFG.barge,'Poder interrumpir a la IA hablándole encima','Usalo solo con auriculares; con parlantes, el micrófono se escucha a la IA y se confunde.'):''}
     <div class="row"><button class="btn primary big" data-act="start" ${ready?'':'disabled'}>${ICON.mic}Empezar la charla</button></div>
+    ${isG()?'<p class="small muted">IA: Gemini, plan gratuito. Google indica que puede usar el contenido enviado para mejorar sus productos.</p>':''}
     <p class="small muted">Tip: probá primero en un lugar tranquilo. Si el dictado corta tus frases a la mitad, subí «pausa antes de responder» en Ajustes.</p>
   </div>${S.hist.length?`<div class="card"><h2>Sesiones anteriores</h2><div class="hist">${S.hist.slice(0,6).map(h=>`<div><div class="h"><span>${esc(MODES[h.mode]?MODES[h.mode].name:h.mode)} · <span class="muted">${esc(h.tema||'tema libre')}</span></span><span>${h.rep&&h.rep.nota!=null?`<b>${nota1(h.rep.nota)}/10</b> `:''}<span class="muted small">${new Date(h.ts).toLocaleDateString('es-AR',{day:'numeric',month:'short'})}</span> <button class="btn small ghost" data-open="${h.id}">Ver</button></span></div></div>`).join('')}</div></div>`:''}`;
 }
@@ -726,18 +792,22 @@ function renderAjustes(){
   const el=$('#p-ajustes');
   const vopts=VOICES.map(v=>`<option value="${esc(v.voiceURI)}" ${v.voiceURI===CFG.voice?'selected':''}>${esc(v.name)} (${esc(v.lang)})</option>`).join('');
   el.innerHTML=`
-  <div class="card"><h2>Clave de la API de Anthropic</h2>
-    <p class="muted small">La charla usa tu propia clave. Se guarda solo en este navegador y viaja directo a Anthropic: nunca pasa por un servidor intermedio ni se sube a GitHub.</p>
-    <label class="fld">Clave (empieza con sk-ant-…)<input type="password" id="key" autocomplete="off" spellcheck="false" value="${esc(CFG.key)}" placeholder="sk-ant-..."></label>
-    <div class="row"><button class="btn primary" data-act="savekey">Guardar y probar</button>${CFG.key?'<button class="btn" data-act="delkey">Borrar clave</button>':''}<a class="btn ghost" href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener">Crear una clave</a></div>
+  <div class="card"><h2>¿Qué IA usar?</h2>
+    <div class="seg" role="group"><button type="button" data-prov="gemini" aria-pressed="${isG()}">Gemini (gratis)</button><button type="button" data-prov="anthropic" aria-pressed="${!isG()}">Claude (de pago)</button></div>
+    ${isG()?`<p class="muted small">Gemini es de Google y tiene un plan gratuito que no pide tarjeta. En el plan gratuito, Google indica que el contenido enviado puede usarse para mejorar sus productos, y hay un límite de consultas por minuto y por día.</p>`:`<p class="muted small">Claude se paga por uso con una clave de la API de Anthropic, aparte de cualquier suscripción. Suele corregir mejor.</p>`}
+  </div>
+  <div class="card"><h2>Clave de ${isG()?'Gemini':'la API de Anthropic'}</h2>
+    <p class="muted small">Se guarda solo en este navegador y viaja directo a ${isG()?'Google':'Anthropic'}: nunca pasa por un servidor intermedio ni se sube a GitHub.</p>
+    <label class="fld">Clave${isG()?'':' (empieza con sk-ant-…)'}<input type="password" id="key" autocomplete="off" spellcheck="false" value="${esc(activeKey())}" placeholder="${isG()?'Pegá acá tu clave de Gemini':'sk-ant-...'}"></label>
+    <div class="row"><button class="btn primary" data-act="savekey">Guardar y probar</button>${activeKey()?'<button class="btn" data-act="delkey">Borrar clave</button>':''}<a class="btn ghost" href="${isG()?'https://aistudio.google.com/apikey':'https://console.anthropic.com/settings/keys'}" target="_blank" rel="noopener">Crear una clave</a></div>
     <div class="note ${S.keyMsgCls}" id="keymsg" ${S.keyMsg?'':'hidden'}>${esc(S.keyMsg)}</div>
-    <p class="small muted">Consejo: creá una clave solo para esta app y ponele un límite de gasto mensual en la consola de Anthropic.</p>
+    ${isG()?`<p class="small muted">Cómo conseguirla gratis: entrá a AI Studio con tu cuenta de Google, aceptá los términos y tocá «Create API key». Si te dice que la clave no sirve, restringila a «Gemini API» desde esa misma pantalla.</p>`:`<p class="small muted">Consejo: creá una clave solo para esta app y ponele un límite de gasto mensual en la consola de Anthropic.</p>`}
   </div>
   <div class="card"><h2>Modelos</h2>
-    <div class="grid2"><label class="fld">Para charlar (conviene uno rápido)<input type="text" id="model" list="mlist" value="${esc(CFG.model)}"></label>
-    <label class="fld">Para la devolución final<input type="text" id="repModel" list="mlist" value="${esc(CFG.repModel)}"></label></div>
-    <datalist id="mlist"><option value="claude-haiku-5-5"><option value="claude-sonnet-5-5"><option value="claude-opus-5-5"></datalist>
-    <p class="small muted">Haiku responde más rápido, algo clave en una charla; Sonnet razona mejor. Podés cambiar los nombres si salen modelos nuevos.</p>
+    <div class="grid2"><label class="fld">Para charlar (conviene uno rápido)<input type="text" id="model" list="mlist" value="${esc(isG()?CFG.gmodel:CFG.model)}"></label>
+    <label class="fld">Para la devolución final<input type="text" id="repModel" list="mlist" value="${esc(isG()?CFG.grepModel:CFG.repModel)}"></label></div>
+    <datalist id="mlist">${isG()?'<option value="gemini-3.1-flash-lite"><option value="gemini-3.5-flash-lite"><option value="gemini-3.5-flash"><option value="gemini-3.6-flash"><option value="gemini-3.8-flash">':'<option value="claude-haiku-5-5"><option value="claude-sonnet-5-5"><option value="claude-opus-5-5">'}</datalist>
+    <p class="small muted">${isG()?'Los modelos «lite» responden más rápido, algo clave en una charla. No todos los modelos entran en el plan gratuito: si uno da error, probá con otro de la lista.':'Haiku responde más rápido, algo clave en una charla; Sonnet razona mejor.'} Podés cambiar los nombres si salen modelos nuevos.</p>
   </div>
   <div class="card"><h2>Voz y escucha</h2>
     <div class="grid2">
@@ -750,8 +820,8 @@ function renderAjustes(){
     <p class="small muted">«Pausa antes de responder» es cuánto silencio espera la app antes de entender que terminaste de hablar. Si te corta a mitad de frase, subila. Las voces más naturales suelen estar en Microsoft Edge (busca las que dicen «Natural» u «Online»).</p>
   </div>`;
   const on=(id,fn)=>{const x=$('#'+id);x&&x.addEventListener('input',()=>fn(x))};
-  on('model',x=>{CFG.model=x.value.trim()||'claude-haiku-5-5';saveCfg()});
-  on('repModel',x=>{CFG.repModel=x.value.trim()||'claude-sonnet-5-5';saveCfg()});
+  on('model',x=>{const v=x.value.trim();if(isG())CFG.gmodel=v||'gemini-3.1-flash-lite';else CFG.model=v||'claude-haiku-5-5';saveCfg()});
+  on('repModel',x=>{const v=x.value.trim();if(isG())CFG.grepModel=v||'gemini-3.5-flash';else CFG.repModel=v||'claude-sonnet-5-5';saveCfg()});
   on('voice',x=>{CFG.voice=x.value;saveCfg()});
   on('lang',x=>{CFG.lang=x.value;saveCfg()});
   on('rate',x=>{CFG.rate=+x.value;$('#rateV').textContent=CFG.rate.toFixed(2)+'×';saveCfg()});
@@ -761,11 +831,12 @@ function renderAjustes(){
 }
 async function saveKey(){
   const k=$('#key').value.trim();
-  if(!/^sk-ant-/.test(k)){S.keyMsg='La clave debería empezar con «sk-ant-». Revisá que la hayas copiado completa.';S.keyMsgCls='bad';renderAjustes();return}
-  CFG.key=k;saveCfg();S.keyMsg='Probando la clave…';S.keyMsgCls='';renderAjustes();
+  if(!isG()&&!/^sk-ant-/.test(k)){S.keyMsg='La clave de Claude debería empezar con «sk-ant-». Revisá que la hayas copiado completa.';S.keyMsgCls='bad';renderAjustes();return}
+  if(isG()&&k.length<20){S.keyMsg='Esa clave parece demasiado corta. Revisá que la hayas copiado completa.';S.keyMsgCls='bad';renderAjustes();return}
+  if(isG())CFG.gkey=k;else CFG.key=k;saveCfg();S.keyMsg='Probando la clave…';S.keyMsgCls='';renderAjustes();
   try{
-    const out=await completeOnce({model:CFG.model,system:'Respondé solo con la palabra OK.',messages:[{role:'user',content:'Probando.'}],max_tokens:8});
-    S.keyMsg='Listo: la clave funciona con el modelo «'+CFG.model+'».';S.keyMsgCls='ok';
+    await completeOnce({model:chatModel(),system:'Respondé solo con la palabra OK.',messages:[{role:'user',content:'Probando.'}],max_tokens:8});
+    S.keyMsg='Listo: la clave funciona con '+providerName()+' y el modelo «'+chatModel()+'».';S.keyMsgCls='ok';
   }catch(e){S.keyMsg=(e instanceof ApiErr)?e.message:'No pude probar la clave.';S.keyMsgCls='bad'}
   renderAjustes();renderCharlaIfIdle();
 }
@@ -784,6 +855,7 @@ document.addEventListener('click',e=>{
   const tb=e.target.closest('.tab');if(tb){if(L.on&&tb.dataset.tab!=='charla'){/* la charla sigue en curso */}showTab(tb.dataset.tab);return}
   const s=e.target.closest('[data-set]');
   if(s&&!L.on){const k=s.dataset.set,v=s.dataset.v;S.setup[k]=(k==='min')?+v:v;renderCharla();return}
+  const pv=e.target.closest('[data-prov]');if(pv&&!L.on){CFG.provider=pv.dataset.prov;saveCfg();S.keyMsg='';S.keyMsgCls='';renderAjustes();return}
   const op=e.target.closest('[data-open]');
   if(op){const h=S.hist.find(x=>x.id===op.dataset.open);if(h){$('#p-charla').innerHTML=`<div class="card">${reportHTML(h)}<div class="row"><button class="btn primary" data-act="newSession">Volver</button></div></div>`}return}
   const d=e.target.closest('[data-del]');if(d){S.delAsk=d.dataset.del;renderApuntes();return}
@@ -810,7 +882,7 @@ document.addEventListener('click',e=>{
     else if(L.state==='listening'||L.state==='paused'){clearTimeout(L.ct);L.err='';commitTurn(join(heard(),t))}
   }
   else if(act==='savekey')saveKey();
-  else if(act==='delkey'){CFG.key='';saveCfg();S.keyMsg='Clave borrada de este navegador.';S.keyMsgCls='';renderAjustes()}
+  else if(act==='delkey'){if(isG())CFG.gkey='';else CFG.key='';saveCfg();S.keyMsg='Clave borrada de este navegador.';S.keyMsgCls='';renderAjustes()}
   else if(act==='testvoice')speakNow('Hola, soy tu examinadora. ¿Me escuchás bien? Esta es la voz que vas a usar.');
 });
 document.addEventListener('change',e=>{
